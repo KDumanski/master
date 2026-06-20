@@ -1,6 +1,6 @@
 const path = require('path');
 const puppeteer = require('c:/Propcheck Git/front-end/node_modules/puppeteer');
-const BASE = 'http://localhost:4322';
+const BASE = 'http://localhost:4323';
 const OUT = path.join(__dirname, '..', '.shots');
 require('fs').mkdirSync(OUT, { recursive: true });
 const shots = [

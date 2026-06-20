@@ -9,6 +9,7 @@
     "start": "next start",
     "lint": "next lint",
     "serve": "npx serve out",
+    "preview": "node scripts/preview.mjs",
     "sites:status": "node scripts/status.mjs",
     "sites:stage": "node scripts/stage.mjs",
     "sites:deploy": "node scripts/deploy.mjs"

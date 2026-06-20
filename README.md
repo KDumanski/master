@@ -42,6 +42,7 @@ All scripts are **dry-run by default** and only act on sites with `manage: true`
 
 | Command | What it does |
 |---|---|
+| `npm run preview <key>` | Build (if needed), serve, and **open the site in your browser**. The "ask → change → see it" loop. `--build` forces a rebuild, `--list` lists keys. **Safe anytime.** |
 | `npm run sites:status` | Read-only. Branch, uncommitted changes, ahead/behind, whether a deploy workflow exists. **Safe anytime.** |
 | `npm run sites:stage` | Shows which repos would get the universal deploy workflow. |
 | `node scripts/stage.mjs --apply --commit` | Writes `.github/workflows/deploy.yml` into each repo and commits it. |
