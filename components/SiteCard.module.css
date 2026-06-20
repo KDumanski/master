@@ -1,0 +1,59 @@
+.card {
+  display: flex; flex-direction: column; gap: 0.45rem;
+  padding: var(--sp-3); border-radius: var(--radius);
+  border: 1px solid var(--line); background: var(--bg-elev-2);
+  color: var(--ink); box-shadow: var(--shadow-sm); position: relative; overflow: hidden;
+  transition: transform 0.35s var(--ease), border-color 0.35s var(--ease), box-shadow 0.35s var(--ease);
+}
+.card::before {
+  content: ''; position: absolute; inset: 0 0 auto 0; height: 3px;
+  background: var(--accent-site); opacity: 0.9;
+}
+.cardLive:hover { transform: translateY(-4px); border-color: var(--line-strong); box-shadow: var(--shadow); }
+
+/* Stretched-link pattern: the site-name anchor covers the whole card so the
+   card is clickable, while siblings with a higher z-index (the repo link)
+   stay independently clickable. No nested anchors. */
+.name { position: static; }
+.stretch { color: var(--ink); }
+.stretch::after { content: ''; position: absolute; inset: 0; z-index: 1; }
+.stretch:hover { opacity: 1; color: var(--accent); }
+
+.top { display: flex; align-items: center; justify-content: space-between; margin-top: 0.25rem; }
+.avatar {
+  width: 40px; height: 40px; border-radius: 11px;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-family: var(--font-display); font-weight: 700; font-size: 0.95rem;
+  background: color-mix(in srgb, var(--accent-site) 18%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent-site) 38%, transparent);
+  color: var(--ink);
+}
+.status {
+  display: inline-flex; align-items: center; gap: 0.4em;
+  font-size: var(--fs-tiny); font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+  padding: 0.25em 0.7em; border-radius: 999px;
+}
+.dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+.live { color: var(--accent2); background: color-mix(in srgb, var(--accent2) 14%, transparent); }
+.live .dot { background: var(--accent2); }
+.staging { color: var(--amber); background: color-mix(in srgb, var(--amber) 14%, transparent); }
+.staging .dot { background: var(--amber); }
+
+.name { font-size: var(--fs-md); margin: 0.3em 0 0; }
+.blurb { color: var(--ink-soft); font-size: var(--fs-small); margin: 0; line-height: 1.5; }
+
+.meta { display: flex; flex-wrap: wrap; gap: 0.5em 1em; margin-top: 0.5rem; }
+.domain, .pages, .stack { font-size: var(--fs-tiny); color: var(--ink-faint); font-weight: 600; }
+.stack {
+  margin-left: auto; padding: 0.1em 0.6em; border-radius: 6px;
+  border: 1px solid var(--line); color: var(--ink-soft);
+}
+
+.foot {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-top: auto; padding-top: 0.75rem;
+}
+.visit { font-size: var(--fs-small); font-weight: 700; color: var(--accent); }
+.pending { font-size: var(--fs-small); font-weight: 600; color: var(--ink-faint); }
+.repo { position: relative; z-index: 2; font-size: var(--fs-tiny); color: var(--ink-faint); font-weight: 600; }
+.repo:hover { color: var(--accent); opacity: 1; }
