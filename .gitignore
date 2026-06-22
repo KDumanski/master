@@ -21,3 +21,8 @@ npm-debug.log*
 
 # screenshots / scratch
 /.shots/
+
+# google oauth tokens / client secrets — NEVER commit
+/.secrets/
+*_token.json
+credentials*.json
