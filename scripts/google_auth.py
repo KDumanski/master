@@ -23,8 +23,13 @@ CLIENT_FILE = os.path.join(SECRETS_DIR, 'credentials.json')
 TOKENS = {
     ('personal', 'drive'): 'personal_drive_token.json',
     ('personal', 'gmail'): 'personal_gmail_token.json',
+    ('personal', 'photos'): 'personal_photos_token.json',
     ('stoop',    'drive'): 'stoop_drive_token.json',
     ('stoop',    'gmail'): 'stoop_gmail_token.json',
+    ('stoop',    'photos'): 'stoop_photos_token.json',
+    # St. Mark's Yoga brand account (12stmarksyoga@gmail.com) - used by the daily
+    # insights pipeline to drop the raw Recess CSV exports into the studio's Drive.
+    ('stmarksyoga', 'drive'): 'stmarksyoga_drive_token.json',
 }
 
 SCOPES = {
@@ -37,6 +42,13 @@ SCOPES = {
     'gmail': [
         'https://www.googleapis.com/auth/gmail.readonly',
         'https://www.googleapis.com/auth/gmail.send',
+    ],
+    # Google Photos Picker API (read-only). Google removed the old full-library
+    # read scopes in March 2025; this is the supported replacement. The user
+    # picks specific items in a Google-hosted picker and we only ever receive
+    # exactly what they select — there is no "browse the whole library" anymore.
+    'photos': [
+        'https://www.googleapis.com/auth/photospicker.mediaitems.readonly',
     ],
 }
 
@@ -107,8 +119,8 @@ if __name__ == '__main__':
     sub = p.add_subparsers(dest='cmd')
 
     c = sub.add_parser('consent', help='Run interactive OAuth consent for one account+capability')
-    c.add_argument('--account', required=True, choices=['personal', 'stoop'])
-    c.add_argument('--capability', required=True, choices=['drive', 'gmail'])
+    c.add_argument('--account', required=True, choices=['personal', 'stoop', 'stmarksyoga'])
+    c.add_argument('--capability', required=True, choices=['drive', 'gmail', 'photos'])
 
     s = sub.add_parser('status', help='Show which tokens exist and are valid')
 
@@ -132,12 +144,16 @@ if __name__ == '__main__':
                 if cap == 'drive':
                     svc = service(acct, cap, 'drive', 'v3')
                     who = svc.about().get(fields='user(emailAddress)').execute()['user']['emailAddress']
-                else:
+                elif cap == 'gmail':
                     try:
                         svc = service(acct, cap, 'gmail', 'v1')
                         who = svc.users().getProfile(userId='me').execute().get('emailAddress', '')
                     except Exception:
                         who = '(send-only token, cannot read profile)'
+                else:
+                    # Photos Picker tokens have no identity/profile endpoint;
+                    # a loadable, unexpired token is the only validity signal.
+                    who = '(photos picker token)'
                 print(f"  {acct:8s} {cap:6s}: VALID -> {who}")
             except Exception as e:
                 print(f"  {acct:8s} {cap:6s}: INVALID -> {type(e).__name__}: {str(e)[:80]}")
