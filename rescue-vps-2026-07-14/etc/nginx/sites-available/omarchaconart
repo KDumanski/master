@@ -1,0 +1,37 @@
+server {
+    listen 80;
+    listen [::]:80;
+    server_name omarchaconart.com www.omarchaconart.com;
+    location ^~ /.well-known/acme-challenge/ { root /var/www/certbot; default_type "text/plain"; }
+    location / { return 301 https://$host$request_uri; }
+}
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name omarchaconart.com www.omarchaconart.com;
+    ssl_certificate /etc/letsencrypt/live/omarchaconart.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/omarchaconart.com/privkey.pem;
+    client_max_body_size 25M;
+
+    location ^~ /.well-known/acme-challenge/ { root /var/www/certbot; default_type "text/plain"; }
+
+    # Uploaded images served straight from disk by nginx (no Next restart needed).
+    location ^~ /uploads/ {
+        alias /var/www/omar/public/uploads/;
+        access_log off;
+        expires 30d;
+        try_files $uri =404;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:3001;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}
