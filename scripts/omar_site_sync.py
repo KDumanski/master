@@ -8,14 +8,22 @@ pushes — which triggers the GitHub Pages deploy. The site itself is fully
 static (KDumanski/Omar-art-website); this local script IS the upload pipeline,
 running where the Drive OAuth tokens already live (masters/.secrets/).
 
+Alongside the photos, an "Omar Website Info" Google Sheet lives in the same
+folder. Omar fills one row per photo (file name + Title / Year / Medium / Size /
+Price-or-status / Show). This script reads that sheet every run and applies those
+fields to the matching work — so Omar can also FIX a painting's info later
+without re-uploading. Filename-only still works: a photo with no sheet row just
+gets a title guessed from its file name. The sheet is optional; if it's missing
+the sync behaves exactly as it did before.
+
 Usage:
   python scripts/omar_site_sync.py            # sync + commit + push
   python scripts/omar_site_sync.py --dry-run  # show what would happen
   python scripts/omar_site_sync.py --no-push  # sync + commit, don't push
 
-Idempotent: a Drive file is skipped when its slug already has a JPEG in
-public/uploads/. New works land at the top of the Paintings page (year taken
-from a 4-digit number in the filename when present).
+Idempotent: a Drive file is skipped for RE-DOWNLOAD when its slug already has a
+JPEG in public/uploads/, but sheet info is re-applied to existing works every
+run. New works land at the top of the Paintings page.
 """
 import argparse
 import io
@@ -40,6 +48,7 @@ except ImportError:
     HEIC_OK = False
 
 FOLDER_ID = '1J37tudsgrwjvyH8DX8GZ7oL9GkmAL1ip'  # Drive: "Omar Website Photos"
+INFO_SHEET_NAME = 'Omar Website Info'  # Google Sheet in that folder; Omar fills it
 APP_DIR = r'c:\Propcheck Git\clone\Omar-app'
 UPLOADS = os.path.join(APP_DIR, 'public', 'uploads')
 SITE_DATA = os.path.join(APP_DIR, 'content', 'site-data.json')
@@ -65,6 +74,84 @@ def prettify(stem):
 def year_of(stem):
     m = re.search(r'\b(19|20)\d{2}\b', stem)
     return int(m.group(0)) if m else None
+
+
+def match_key(name):
+    """Loose key for pairing a sheet row to a photo: lowercase, drop the file
+    extension, strip everything but letters/digits. So "BDPM IX.jpg",
+    "bdpm ix", and "BDPM_IX" all collapse to the same key."""
+    stem = os.path.splitext(name)[0] if '.' in name else name
+    return re.sub(r'[^a-z0-9]', '', stem.lower())
+
+
+def load_show_lookup(data):
+    """Map a loosely-typed show name back to its slug. Omar can type "Sin Seine"
+    or "sin-seine"; both resolve. Returns {normalized_name: slug}."""
+    norm = lambda s: re.sub(r'[^a-z0-9]', '', (s or '').lower())
+    lookup = {}
+    for s in data.get('shows', []):
+        lookup[norm(s.get('slug'))] = s['slug']
+        lookup[norm(s.get('title'))] = s['slug']
+    return lookup
+
+
+def read_info_sheet(sheets_api, drive):
+    """Return {match_key: {title, year, medium, dimensions, status, show}} from
+    the "Omar Website Info" sheet in the folder. Empty dict if the sheet is
+    missing or unreadable — the sync then falls back to filename-only behavior.
+
+    Columns by position (header row skipped): A file name, B title, C year,
+    D medium, E size, F price/status, G show. Blank cells are ignored so a
+    partly-filled row still helps."""
+    q = ("'%s' in parents and trashed=false and "
+         "mimeType='application/vnd.google-apps.spreadsheet' and name='%s'"
+         % (FOLDER_ID, INFO_SHEET_NAME))
+    found = drive.files().list(q=q, fields='files(id,name)').execute().get('files', [])
+    if not found:
+        print(f'  (no "{INFO_SHEET_NAME}" sheet found — using file names only)')
+        return {}
+    sid = found[0]['id']
+    rows = sheets_api.spreadsheets().values().get(
+        spreadsheetId=sid, range='A2:G').execute().get('values', [])
+
+    def cell(row, i):
+        return row[i].strip() if i < len(row) and row[i] is not None else ''
+
+    info = {}
+    for row in rows:
+        fname = cell(row, 0)
+        if not fname or fname.startswith('('):  # skip the placeholder helper row
+            continue
+        year = cell(row, 2)
+        info[match_key(fname)] = {
+            'title': cell(row, 1) or None,
+            'year': int(re.search(r'\d{4}', year).group(0)) if re.search(r'\d{4}', year) else None,
+            'medium': cell(row, 3) or None,
+            'dimensions': cell(row, 4) or None,
+            'status': cell(row, 5) or None,
+            'show': cell(row, 6) or None,
+        }
+    print(f'  read {len(info)} info row(s) from "{INFO_SHEET_NAME}".')
+    return info
+
+
+def apply_info(work, row, show_lookup):
+    """Overlay non-empty sheet values onto a work dict. Returns True if it changed
+    anything. Only fields Omar actually filled are touched — a blank cell never
+    wipes existing data."""
+    changed = False
+    for field in ('title', 'year', 'medium', 'dimensions', 'status'):
+        val = row.get(field)
+        if val not in (None, '') and work.get(field) != val:
+            work[field] = val
+            changed = True
+    show = row.get('show')
+    if show:
+        slug = show_lookup.get(re.sub(r'[^a-z0-9]', '', show.lower()))
+        if slug and work.get('showSlug') != slug:
+            work['showSlug'] = slug
+            changed = True
+    return changed
 
 
 def list_drive_images(drive):
@@ -113,6 +200,7 @@ def main():
     args = ap.parse_args()
 
     drive = service('personal', 'drive', 'drive', 'v3')
+    sheets_api = service('personal', 'drive', 'sheets', 'v4')  # drive-scope token covers Sheets
     images = list_drive_images(drive)
     print(f"Drive folder has {len(images)} image file(s).")
 
@@ -121,7 +209,12 @@ def main():
         data = json.load(f)
     known_slugs = {w['slug'] for w in data.get('works', [])}
 
-    added = []
+    info = read_info_sheet(sheets_api, drive)  # {match_key: {title, year, ...}}
+    show_lookup = load_show_lookup(data)
+    # Remember each work's match key so sheet edits can find already-synced works.
+    key_to_work = {match_key(w['slug']): w for w in data.get('works', [])}
+
+    added = []      # newly-downloaded photos
     for f in images:
         stem, ext = os.path.splitext(f['name'])
         slug = slugify(stem)
@@ -143,23 +236,41 @@ def main():
         finally:
             os.unlink(tmp_path)
         if slug not in known_slugs:
-            data['works'].insert(0, {
+            row = info.get(match_key(f['name']), {})
+            work = {
                 'slug': slug,
-                'title': prettify(stem),
-                'year': year_of(stem),
-                'medium': '',
-                'dimensions': '',
+                'title': row.get('title') or prettify(stem),
+                'year': row.get('year') if row.get('year') is not None else year_of(stem),
+                'medium': row.get('medium') or '',
+                'dimensions': row.get('dimensions') or '',
                 'image': f'/uploads/{slug}.jpg',
-                'status': None,
+                'status': row.get('status'),
                 'surface': None,
                 'tier': None,
                 'showSlug': None,
                 'sort_order': -1,  # newest first until curated
-            })
+            }
+            if row.get('show'):
+                s = show_lookup.get(re.sub(r'[^a-z0-9]', '', row['show'].lower()))
+                if s:
+                    work['showSlug'] = s
+            data['works'].insert(0, work)
             known_slugs.add(slug)
+            key_to_work[match_key(slug)] = work
         added.append(slug)
 
-    if not added:
+    # Second pass: apply sheet edits to works that already existed (so Omar can
+    # correct a painting's title/year/medium/size/status/show without re-uploading).
+    edited = 0
+    for key, row in info.items():
+        work = key_to_work.get(key)
+        if work and match_key(work['slug']) not in {match_key(s) for s in added}:
+            if not args.dry_run and apply_info(work, row, show_lookup):
+                edited += 1
+    if edited:
+        print(f'  updated info on {edited} existing work(s) from the sheet.')
+
+    if not added and not edited:
         print('Nothing new — site already up to date.')
         return
     if args.dry_run:
@@ -169,14 +280,19 @@ def main():
     with open(SITE_DATA, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+    parts = []
+    if added:
+        parts.append(f"add {len(added)} new painting photo(s)")
+    if edited:
+        parts.append(f"update info on {edited} work(s)")
+    msg = "Sync Omar's Drive folder: " + " + ".join(parts)
     run(['git', 'add', 'content/site-data.json', 'public/uploads'], APP_DIR)
-    run(['git', 'commit', '-m',
-         f"Sync {len(added)} new painting photo(s) from Omar's Drive folder"], APP_DIR)
+    run(['git', 'commit', '-m', msg], APP_DIR)
     if args.no_push:
-        print(f'Committed {len(added)} new work(s); push skipped (--no-push).')
+        print(f'Committed: {msg[len("Sync Omar\'s Drive folder: "):]}; push skipped (--no-push).')
         return
     run(['git', 'push', 'origin', 'main'], APP_DIR)
-    print(f'Pushed {len(added)} new work(s) — GitHub Pages will redeploy in ~2 minutes.')
+    print(f'Pushed ({" + ".join(parts)}) — GitHub Pages will redeploy in ~2 minutes.')
 
 
 if __name__ == '__main__':
