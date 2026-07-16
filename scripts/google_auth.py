@@ -74,6 +74,21 @@ def get_credentials(account, capability, allow_consent=True):
     tok = token_path(account, capability)
     scopes = SCOPES[capability]
 
+    # CI path: no .secrets/ on a GitHub Actions runner, so allow the token JSON to
+    # arrive as an env var (e.g. GOOGLE_TOKEN_PERSONAL_DRIVE from a repo secret).
+    # Local runs still use the file, which stays the source of truth.
+    env_var = f'GOOGLE_TOKEN_{account.upper()}_{capability.upper()}'
+    raw = os.environ.get(env_var)
+    if raw and not os.path.exists(tok):
+        import json as _json
+        info = _json.loads(raw)
+        creds = Credentials.from_authorized_user_info(info, scopes)
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())  # refreshed in-memory; runner is ephemeral
+        if creds and creds.valid:
+            return creds
+        raise RuntimeError(f'{env_var} was set but did not yield valid credentials.')
+
     if os.path.exists(tok):
         try:
             creds = Credentials.from_authorized_user_file(tok, scopes)

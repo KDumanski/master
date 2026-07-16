@@ -49,7 +49,9 @@ except ImportError:
 
 FOLDER_ID = '1J37tudsgrwjvyH8DX8GZ7oL9GkmAL1ip'  # Drive: "Omar Website Photos"
 INFO_SHEET_NAME = 'Omar Website Info'  # Google Sheet in that folder; Omar fills it
-APP_DIR = r'c:\Propcheck Git\clone\Omar-app'
+# Where the site repo lives. Defaults to the local Windows clone; GitHub Actions
+# sets OMAR_APP_DIR to its checkout so the same script runs unmodified in CI.
+APP_DIR = os.environ.get('OMAR_APP_DIR', r'c:\Propcheck Git\clone\Omar-app')
 UPLOADS = os.path.join(APP_DIR, 'public', 'uploads')
 SITE_DATA = os.path.join(APP_DIR, 'content', 'site-data.json')
 
