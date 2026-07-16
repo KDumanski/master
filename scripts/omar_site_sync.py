@@ -96,13 +96,13 @@ def load_show_lookup(data):
 
 
 def read_info_sheet(sheets_api, drive):
-    """Return {match_key: {title, year, medium, dimensions, status, show}} from
-    the "Omar Website Info" sheet in the folder. Empty dict if the sheet is
+    """Return {match_key: {where, title, year, medium, dimensions, status, show}}
+    from the "Omar Website Info" sheet in the folder. Empty dict if the sheet is
     missing or unreadable — the sync then falls back to filename-only behavior.
 
-    Columns by position (header row skipped): A file name, B title, C year,
-    D medium, E size, F price/status, G show. Blank cells are ignored so a
-    partly-filled row still helps."""
+    Columns by position (header row skipped): A file name, B where-on-site,
+    C title, D year, E medium, F size, G price/status, H show. Blank cells are
+    ignored so a partly-filled row still helps."""
     q = ("'%s' in parents and trashed=false and "
          "mimeType='application/vnd.google-apps.spreadsheet' and name='%s'"
          % (FOLDER_ID, INFO_SHEET_NAME))
@@ -112,7 +112,7 @@ def read_info_sheet(sheets_api, drive):
         return {}
     sid = found[0]['id']
     rows = sheets_api.spreadsheets().values().get(
-        spreadsheetId=sid, range='A2:G').execute().get('values', [])
+        spreadsheetId=sid, range='A2:H').execute().get('values', [])
 
     def cell(row, i):
         return row[i].strip() if i < len(row) and row[i] is not None else ''
@@ -120,37 +120,58 @@ def read_info_sheet(sheets_api, drive):
     info = {}
     for row in rows:
         fname = cell(row, 0)
-        if not fname or fname.startswith('('):  # skip the placeholder helper row
+        if not fname or fname.startswith('('):  # skip the placeholder helper rows
             continue
-        year = cell(row, 2)
+        year = cell(row, 3)
         info[match_key(fname)] = {
-            'title': cell(row, 1) or None,
+            'where': cell(row, 1) or None,   # Homepage / Paintings / a show name
+            'title': cell(row, 2) or None,
             'year': int(re.search(r'\d{4}', year).group(0)) if re.search(r'\d{4}', year) else None,
-            'medium': cell(row, 3) or None,
-            'dimensions': cell(row, 4) or None,
-            'status': cell(row, 5) or None,
-            'show': cell(row, 6) or None,
+            'medium': cell(row, 4) or None,
+            'dimensions': cell(row, 5) or None,
+            'status': cell(row, 6) or None,
+            'show': cell(row, 7) or None,
         }
     print(f'  read {len(info)} info row(s) from "{INFO_SHEET_NAME}".')
     return info
 
 
+def resolve_destination(row, show_lookup):
+    """Turn Omar's "Where on site" cell into an action. Returns one of:
+      ('homepage', None)      -> add the image to the homepage hero list
+      ('show', <slug>)        -> attach the work to that exhibition
+      ('paintings', None)     -> normal: just the paintings gallery
+    The 'Which show' column (H) still works too and wins if 'where' names a show.
+    Unrecognized text falls back to 'paintings' so a typo never hides a photo."""
+    norm = lambda s: re.sub(r'[^a-z0-9]', '', (s or '').lower())
+    # An explicit show in column H takes precedence.
+    if row.get('show') and show_lookup.get(norm(row['show'])):
+        return ('show', show_lookup[norm(row['show'])])
+    where = norm(row.get('where'))
+    if where in ('homepage', 'home', 'frontpage', 'titlepage', 'mainpage', 'landing'):
+        return ('homepage', None)
+    if where and where not in ('paintings', 'painting', 'gallery', 'work', 'works'):
+        slug = show_lookup.get(where)  # maybe they typed a show name in column B
+        if slug:
+            return ('show', slug)
+    return ('paintings', None)
+
+
 def apply_info(work, row, show_lookup):
     """Overlay non-empty sheet values onto a work dict. Returns True if it changed
     anything. Only fields Omar actually filled are touched — a blank cell never
-    wipes existing data."""
+    wipes existing data. Also honors the "Where on site" routing for shows (the
+    homepage list is rebuilt separately in main(), not here)."""
     changed = False
     for field in ('title', 'year', 'medium', 'dimensions', 'status'):
         val = row.get(field)
         if val not in (None, '') and work.get(field) != val:
             work[field] = val
             changed = True
-    show = row.get('show')
-    if show:
-        slug = show_lookup.get(re.sub(r'[^a-z0-9]', '', show.lower()))
-        if slug and work.get('showSlug') != slug:
-            work['showSlug'] = slug
-            changed = True
+    dest, slug = resolve_destination(row, show_lookup)
+    if dest == 'show' and work.get('showSlug') != slug:
+        work['showSlug'] = slug
+        changed = True
     return changed
 
 
@@ -250,10 +271,9 @@ def main():
                 'showSlug': None,
                 'sort_order': -1,  # newest first until curated
             }
-            if row.get('show'):
-                s = show_lookup.get(re.sub(r'[^a-z0-9]', '', row['show'].lower()))
-                if s:
-                    work['showSlug'] = s
+            dest, show_slug = resolve_destination(row, show_lookup)
+            if dest == 'show':
+                work['showSlug'] = show_slug
             data['works'].insert(0, work)
             known_slugs.add(slug)
             key_to_work[match_key(slug)] = work
@@ -270,7 +290,24 @@ def main():
     if edited:
         print(f'  updated info on {edited} existing work(s) from the sheet.')
 
-    if not added and not edited:
+    # Rebuild the homepage hero list from every photo Omar tagged "Homepage".
+    # Only touch heroImages if he has tagged at least one — otherwise his current
+    # hand-picked lead images (the "Vancouver airport" set) stay untouched.
+    hero_changed = False
+    hero_imgs = []
+    for key, row in info.items():
+        dest, _ = resolve_destination(row, show_lookup)
+        if dest == 'homepage':
+            w = key_to_work.get(key)
+            if w and w.get('image') and w['image'] not in hero_imgs:
+                hero_imgs.append(w['image'])
+    if hero_imgs and hero_imgs != data.get('heroImages'):
+        if not args.dry_run:
+            data['heroImages'] = hero_imgs
+        hero_changed = True
+        print(f'  homepage lead images set to {len(hero_imgs)} tagged photo(s).')
+
+    if not added and not edited and not hero_changed:
         print('Nothing new — site already up to date.')
         return
     if args.dry_run:
@@ -285,6 +322,8 @@ def main():
         parts.append(f"add {len(added)} new painting photo(s)")
     if edited:
         parts.append(f"update info on {edited} work(s)")
+    if hero_changed:
+        parts.append(f"set {len(hero_imgs)} homepage image(s)")
     msg = "Sync Omar's Drive folder: " + " + ".join(parts)
     run(['git', 'add', 'content/site-data.json', 'public/uploads'], APP_DIR)
     run(['git', 'commit', '-m', msg], APP_DIR)
