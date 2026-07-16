@@ -47,7 +47,9 @@ try:  # iPhone photos
 except ImportError:
     HEIC_OK = False
 
-FOLDER_ID = '1WNWXzhXNlUmgQOC5axolJToaVKywMjCc'  # "Oceanic Ventures — Website Assets"
+# Fabian shares his photos back via his OWN folder, not the one we created for him.
+# "New Website photos for Keith" (owned by fabianguhl@gmail.com, shared 2026-07-14).
+FOLDER_ID = '14dDJp9wtC8sf9QMwxdhK8My52-4lYZ6C'
 APP_DIR = r'c:\Propcheck Git\clone\Fabians Tours'
 PHOTOS = os.path.join(APP_DIR, 'public', 'photos')
 OVERRIDES = os.path.join(APP_DIR, 'lib', 'imageOverrides.json')
