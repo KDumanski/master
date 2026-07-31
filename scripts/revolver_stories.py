@@ -1,7 +1,7 @@
 """
-Revolver News stories — morning source sweep -> Google Doc.
+Revolver News stories — half-hourly source sweep -> Google Sheet.
 
-Every morning this script:
+Runs every 30 minutes (cron on the GCP box, see deploy_revolver_gcp.sh) and:
   1. Fetches revolver.news (Drudge-style aggregator) to snapshot the headlines
      it is currently running: that gives the topic mix AND the editorial voice.
   2. Pulls fresh stories from the RSS feeds of the outlets Revolver actually
@@ -12,17 +12,21 @@ Every morning this script:
   4. Has Claude pick the candidates that fit Revolver's editorial profile and
      write a one-line blurb for each in the same punchy voice (trailing "...",
      no em dashes).
-  5. Pushes everything to the Google SHEET "Revolver News stories" (tabs:
-     Stories / Social / Accounts, newest rows on top) AND prepends the dated
-     Story | Description table to the Google Doc of the same name.
+  5. Pushes to the Google SHEET "Revolver News stories" — tabs Stories /
+     Social / Accounts / Runs, newest rows on top, every row stamped with the
+     exact pull time. The Runs tab records EVERY check, including the quiet
+     ones, so you can see the job is alive and when each pull happened.
 
 Usage:
-  python scripts/revolver_stories.py           # full run, writes the doc
-  python scripts/revolver_stories.py --test    # 3 sources, print only, no doc
-  python scripts/revolver_stories.py --no-doc  # full scrape+blurbs, print only
+  python scripts/revolver_stories.py            # the scheduled run
+  python scripts/revolver_stories.py --test     # 3 sources, print only
+  python scripts/revolver_stories.py --dry-run  # full sweep, print only
+  python scripts/revolver_stories.py --doc      # also append to the Doc
 
-State: .revolver_seen.json (next to this script, gitignored) remembers URLs
-already published so the same story never lands in the doc twice.
+State: the SHEET itself is the source of truth for what's already published
+(the Link columns are re-read each run), so this runs unchanged on any machine.
+.revolver_seen.json is only a local cache. Set REVOLVER_SHEET_ID to pin the
+target spreadsheet without a state file.
 
 Anthropic key: ANTHROPIC_API_KEY env var, else read from etls/.env.
 Google auth: personal Drive token via google_auth.py (full drive scope covers
@@ -48,7 +52,14 @@ import requests  # noqa: E402
 
 DOC_NAME = 'Revolver News stories'
 SEEN_FILE = os.path.join(SCRIPT_DIR, '.revolver_seen.json')
-ETLS_ENV = r'c:\Propcheck Git\etls\.env'
+# Checked in order for ANTHROPIC_API_KEY when the env var isn't set. Covers the
+# Windows laptop and the GCP box, so the same script runs unmodified on both.
+ENV_FILES = [
+    r'c:\Propcheck Git\etls\.env',
+    r'c:\Propcheck Git\front-end\web\.env',
+    '/root/etls/.env',
+    os.path.join(SCRIPT_DIR, '..', '.env'),
+]
 UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36')
 
@@ -225,7 +236,7 @@ def anthropic_key():
     key = os.environ.get('ANTHROPIC_API_KEY')
     if key:
         return key
-    for env_file in (ETLS_ENV, r'c:\Propcheck Git\front-end\web\.env'):
+    for env_file in ENV_FILES:
         try:
             with open(env_file, encoding='utf-8') as f:
                 for line in f:
@@ -271,7 +282,11 @@ def pick_and_blurb(revolver_heads, candidates):
         + (f' | {c["summary"]}' if c['summary'] else '')
         for i, c in enumerate(candidates, 1))
 
-    prompt = f"""You are the morning editor of a Drudge-style news aggregator modeled on revolver.news.
+    # Runs every 30 minutes, so a batch may be 5 candidates or 250. Scale the
+    # ask to what actually arrived instead of demanding a fixed count.
+    target = max(3, min(50, round(len(candidates) * 0.25)))
+
+    prompt = f"""You are the editor of a Drudge-style news aggregator modeled on revolver.news, doing a routine check for newly published stories.
 
 SECTION A - the headlines currently running on revolver.news (this is your reference for BOTH the topic mix and the editorial voice):
 {ref}
@@ -279,7 +294,7 @@ SECTION A - the headlines currently running on revolver.news (this is your refer
 SECTION B - candidate stories pulled this morning from the source outlets' RSS feeds:
 {cand}
 
-Select the {TARGET_STORIES} candidates from SECTION B that best fit the aggregator's editorial profile shown in SECTION A: politics, immigration, crime, DOJ/FBI, culture-war fights, foreign policy, economy, media criticism, plus the occasional offbeat or big mainstream story. When several outlets carry the same underlying story, keep only the single strongest version. Skip pure celebrity filler, sports scores, and product/deal posts.
+Select roughly {target} candidates from SECTION B that best fit the aggregator's editorial profile shown in SECTION A: politics, immigration, crime, DOJ/FBI, culture-war fights, foreign policy, economy, media criticism, plus the occasional offbeat or big mainstream story. Quality over quota: if fewer genuinely fit, return fewer. When several outlets carry the same underlying story, keep only the single strongest version. Skip pure celebrity filler, sports scores, and product/deal posts.
 
 For each selected story write "blurb": a one-line description in the same voice as the SECTION A headlines. Rules for blurbs:
 - punchy, wry, populist-right editorial framing, like the SECTION A examples
@@ -312,10 +327,17 @@ Copy "headline", "url" and "source" for each pick exactly as given in SECTION B.
             )
     except anthropic.AuthenticationError:
         raise RuntimeError(
-            'Anthropic API key rejected (401). The keys in etls/.env and '
-            'front-end/web/.env were revoked after the July 2026 secrets '
-            'exposure. Create a fresh key at https://console.anthropic.com/ '
-            'and update ANTHROPIC_API_KEY in etls/.env, then re-run.')
+            'Anthropic API key rejected (401). Set a working key as '
+            'ANTHROPIC_API_KEY, or in one of: ' + ', '.join(ENV_FILES))
+    except anthropic.BadRequestError as e:
+        # Out of credit reads as a 400, not a 401 — say so plainly rather than
+        # letting it look like a malformed request.
+        if 'credit balance' in str(e).lower():
+            raise RuntimeError(
+                'Anthropic account is out of credit. Top up at '
+                'https://console.anthropic.com/ (Plans & Billing); the API key '
+                'itself is valid and nothing else needs changing.')
+        raise
 
     if resp.stop_reason == 'refusal':
         raise RuntimeError('Claude declined the selection request (refusal)')
@@ -443,17 +465,26 @@ def push_to_doc(stories, date_label):
 # ---------------------------------------------------------------- Google Sheet
 
 SHEET_TABS = {
-    'Stories':  ['Date', 'Story', 'Source', 'Description', 'Link'],
-    'Social':   ['Date', 'Account', 'Post', 'Link'],
+    'Stories':  ['Pulled', 'Story', 'Source', 'Description', 'Link'],
+    'Social':   ['Pulled', 'Account', 'Post', 'Link'],
     'Accounts': ['Account', 'Times linked', 'Last seen', 'Profile'],
+    'Runs':     ['Pulled', 'Candidates', 'Stories added', 'Social added', 'Status'],
+    # Ledger of every URL already shown to the model. Without it a 30-minute
+    # cadence would re-send the same rejected stories ~48 times a day.
+    'Seen':     ['URL', 'First seen', 'Source', 'Picked'],
 }
 
 # Pixel widths per tab, in column order. Long prose columns get wrapped.
 SHEET_WIDTHS = {
-    'Stories':  [90, 400, 110, 450, 300],
-    'Social':   [90, 190, 620, 280],
+    'Stories':  [140, 400, 110, 450, 300],
+    'Social':   [140, 190, 620, 280],
     'Accounts': [170, 100, 100, 240],
+    'Runs':     [140, 100, 110, 110, 420],
+    'Seen':     [420, 140, 120, 70],
 }
+
+# Where each tab keeps the URL that identifies a row, for sheet-based dedup.
+DEDUP_COLS = {'Stories': 'E', 'Social': 'D', 'Seen': 'A'}
 
 
 def format_sheet(sheets, sid, gids):
@@ -486,11 +517,12 @@ def format_sheet(sheets, sid, gids):
 def find_or_create_sheet(state):
     sheets = service('personal', 'drive', 'sheets', 'v4')
     drive = service('personal', 'drive', 'drive', 'v3')
-    sid = state.get('sheet_id')
+    sid = state.get('sheet_id') or os.environ.get('REVOLVER_SHEET_ID')
     if sid:
         try:
             sheets.spreadsheets().get(spreadsheetId=sid,
                                       fields='spreadsheetId').execute()
+            state['sheet_id'] = sid
             return sheets, sid
         except Exception:
             pass
@@ -533,47 +565,92 @@ def _prepend_rows(sheets, sid, gid, title, rows):
         valueInputOption='RAW', body={'values': rows}).execute()
 
 
-def push_to_sheet(stories, socials):
-    sheets, sid = find_or_create_sheet(STATE)
+def ensure_tabs(sheets, sid):
+    """Add any missing tab (and its header) so old sheets pick up new tabs."""
     meta = sheets.spreadsheets().get(
         spreadsheetId=sid, fields='sheets(properties(sheetId,title))').execute()
     gids = {s['properties']['title']: s['properties']['sheetId']
             for s in meta['sheets']}
-    day = f'{datetime.now(timezone.utc).astimezone():%Y-%m-%d}'
+    missing = [t for t in SHEET_TABS if t not in gids]
+    if missing:
+        added = sheets.spreadsheets().batchUpdate(spreadsheetId=sid, body={
+            'requests': [{'addSheet': {'properties': {'title': t}}} for t in missing]
+        }).execute()
+        for rep in added['replies']:
+            props = rep['addSheet']['properties']
+            gids[props['title']] = props['sheetId']
+        for t in missing:
+            sheets.spreadsheets().values().update(
+                spreadsheetId=sid, range=f'{t}!A1', valueInputOption='RAW',
+                body={'values': [SHEET_TABS[t]]}).execute()
+        format_sheet(sheets, sid, gids)
+        print(f'  added missing tab(s): {", ".join(missing)}')
+    return gids
+
+
+def load_seen_from_sheet(sheets, sid):
+    """The sheet is the source of truth for what's already been published, so
+    the job can run from any machine without carrying a state file around."""
+    seen = {}
+    for tab, col in DEDUP_COLS.items():
+        try:
+            vals = sheets.spreadsheets().values().get(
+                spreadsheetId=sid, range=f'{tab}!{col}2:{col}').execute().get('values', [])
+            seen[tab] = {r[0].strip() for r in vals if r and r[0].strip()}
+        except Exception:
+            seen[tab] = set()
+    accounts = {}
+    try:
+        vals = sheets.spreadsheets().values().get(
+            spreadsheetId=sid, range='Accounts!A2:C').execute().get('values', [])
+        for row in vals:
+            if not row or not row[0].strip():
+                continue
+            handle = row[0].strip().lstrip('@')
+            try:
+                n = int(row[1]) if len(row) > 1 and str(row[1]).strip() else 0
+            except ValueError:
+                n = 0
+            accounts[handle] = {'n': n, 'last': row[2] if len(row) > 2 else ''}
+    except Exception:
+        pass
+    # A story counts as "seen" once the model has looked at it, whether or not
+    # it was picked, so rejects are never re-sent on the next half-hourly pull.
+    return (seen.get('Stories', set()) | seen.get('Seen', set()),
+            seen.get('Social', set()), accounts)
+
+
+def push_to_sheet(sheets, sid, gids, stamp, stories, socials, accounts):
     _prepend_rows(sheets, sid, gids['Stories'], 'Stories',
-                  [[day, s['headline'], s['source'], s['blurb'], s['url']]
+                  [[stamp, s['headline'], s['source'], s['blurb'], s['url']]
                    for s in stories])
     _prepend_rows(sheets, sid, gids['Social'], 'Social',
-                  [[day, f'{p["account"]} (@{p["handle"]})', p['text'], p['url']]
+                  [[stamp, f'{p["account"]} (@{p["handle"]})', p['text'], p['url']]
                    for p in socials])
     # Accounts roster: rewritten each run, ranked by how often Revolver links them.
-    acct = STATE.get('accounts', {})
-    top = sorted(acct.items(), key=lambda kv: -kv[1]['n'])[:TOP_ACCOUNTS]
+    top = sorted(accounts.items(), key=lambda kv: -kv[1]['n'])[:TOP_ACCOUNTS]
     sheets.spreadsheets().values().clear(
         spreadsheetId=sid, range='Accounts!A2:D10000').execute()
     if top:
         sheets.spreadsheets().values().update(
-            spreadsheetId=sid, range='Accounts!A2',
-            valueInputOption='RAW',
+            spreadsheetId=sid, range='Accounts!A2', valueInputOption='RAW',
             body={'values': [[f'@{h}', d['n'], d['last'], f'https://x.com/{h}']
                              for h, d in top]}).execute()
-    return sid
 
 
-def publish(stories, socials, handle_counts, date_label):
-    """Doc + Sheet + state, in one place so manual runs behave like cron runs."""
-    today = f'{datetime.now(timezone.utc).astimezone():%Y-%m-%d}'
-    acct = STATE.setdefault('accounts', {})
-    for h, n in handle_counts.items():
-        entry = acct.setdefault(h, {'n': 0, 'last': today})
-        entry['n'] += n
-        entry['last'] = today
-    doc_id = push_to_doc(stories, date_label)
-    sheet_id = push_to_sheet(stories, socials)
-    STATE['seen'] = STATE.get('seen', []) + [s['url'] for s in stories]
-    STATE['seen_social'] = STATE.get('seen_social', []) + [p['url'] for p in socials]
-    save_state(STATE)
-    return doc_id, sheet_id
+def log_seen(sheets, sid, gids, stamp, candidates, picked_urls):
+    """Record every candidate the model evaluated, picked or not."""
+    _prepend_rows(sheets, sid, gids['Seen'], 'Seen',
+                  [[c['url'], stamp, c['source'],
+                    'yes' if c['url'] in picked_urls else '']
+                   for c in candidates])
+
+
+def log_run(sheets, sid, gids, stamp, n_cand, n_stories, n_social, status):
+    """Every check writes a row here, including the quiet ones, so the sheet
+    shows the job is alive and exactly when each pull happened."""
+    _prepend_rows(sheets, sid, gids['Runs'], 'Runs',
+                  [[stamp, n_cand, n_stories, n_social, status]])
 
 
 # ---------------------------------------------------------------- main
@@ -582,45 +659,75 @@ STATE = load_state()
 
 
 def main():
-    ap = argparse.ArgumentParser(description='Revolver-style morning story sweep')
+    ap = argparse.ArgumentParser(
+        description='Revolver-style story + social sweep (runs every 30 min)')
     ap.add_argument('--test', action='store_true',
-                    help='3 sources only, print picks, no doc write')
-    ap.add_argument('--no-doc', action='store_true',
-                    help='full run but print instead of writing the doc')
+                    help='3 sources only, print picks, write nothing')
+    ap.add_argument('--dry-run', action='store_true',
+                    help='full sweep but print instead of writing')
+    ap.add_argument('--doc', action='store_true',
+                    help='also append a table to the companion Google Doc')
     args = ap.parse_args()
 
     sources = SOURCES
     if args.test:
         sources = {k: SOURCES[k] for k in list(SOURCES)[:3]}
 
-    print(f'[{datetime.now():%Y-%m-%d %H:%M}] Snapshotting revolver.news ...')
+    stamp = f'{datetime.now(timezone.utc).astimezone():%Y-%m-%d %H:%M}'
+    print(f'[{stamp}] Revolver sweep starting ...')
+
+    # The sheet is opened first because it carries the dedup state.
+    sheets = sid = gids = None
+    seen_stories, seen_social, accounts = set(), set(), {}
+    if not (args.test or args.dry_run):
+        sheets, sid = find_or_create_sheet(STATE)
+        gids = ensure_tabs(sheets, sid)
+        seen_stories, seen_social, accounts = load_seen_from_sheet(sheets, sid)
+        print(f'  sheet state: {len(seen_stories)} stories, '
+              f'{len(seen_social)} posts, {len(accounts)} accounts already logged')
+    else:
+        seen_stories = set(STATE.get('seen', []))
+        seen_social = set(STATE.get('seen_social', []))
+        accounts = dict(STATE.get('accounts', {}))
+
     heads, social_urls, handle_counts = revolver_snapshot()
-    print(f'  {len(heads)} reference headlines, {len(social_urls)} social links, '
+    print(f'  revolver.news: {len(heads)} headlines, {len(social_urls)} social links, '
           f'{len(handle_counts)} accounts')
 
-    seen = set(STATE.get('seen', []))
-    print(f'Pulling {len(sources)} source feeds ...')
-    candidates, report = collect_candidates(sources, seen)
+    candidates, report = collect_candidates(sources, seen_stories)
     print('\n'.join(report))
-    print(f'  {len(candidates)} fresh candidates')
-    if not candidates:
-        print('Nothing new this morning; doc and sheet left untouched.')
-        return
+    print(f'  {len(candidates)} new candidates')
 
-    print('Fetching linked social posts ...')
-    socials = fetch_social_posts(social_urls, set(STATE.get('seen_social', [])))
-    print(f'  {len(socials)} new posts')
+    socials = fetch_social_posts(social_urls, seen_social)
+    print(f'  {len(socials)} new social posts')
+
+    today = stamp[:10]
+    for h, n in handle_counts.items():
+        entry = accounts.setdefault(h, {'n': 0, 'last': today})
+        entry['n'] += n
+        entry['last'] = today
+
+    # Quiet check: log the pull, refresh the roster, skip the model entirely.
+    if not candidates:
+        print('Nothing new since the last pull.')
+        if sheets:
+            push_to_sheet(sheets, sid, gids, stamp, [], socials, accounts)
+            log_run(sheets, sid, gids, stamp, 0, 0, len(socials), 'no new stories')
+            print(f'  Sheet: https://docs.google.com/spreadsheets/d/{sid}/edit')
+        return
 
     print('Asking Claude to pick stories and write blurbs ...')
     try:
         stories = pick_and_blurb(heads, candidates)
     except RuntimeError as e:
-        # Keep the daily log readable: a bad key is a config problem, not a crash.
+        # A bad key is a config problem, not a crash: log it and leave a clean line.
         print(f'STOPPED: {e}')
+        if sheets:
+            log_run(sheets, sid, gids, stamp, len(candidates), 0, 0, f'FAILED: {e}')
         sys.exit(1)
     print(f'  {len(stories)} stories selected')
 
-    if args.test or args.no_doc:
+    if args.test or args.dry_run:
         for s in stories:
             print(f'\n* {s["headline"]}  [{s["source"]}]')
             print(f'    {s["blurb"]}')
@@ -629,11 +736,22 @@ def main():
             print(f'\n@ {p["account"]} (@{p["handle"]}): {p["text"][:120]}')
         return
 
-    date_label = f'{datetime.now(timezone.utc).astimezone():%A, %B %d, %Y}'
-    doc_id, sheet_id = publish(stories, socials, handle_counts, date_label)
+    push_to_sheet(sheets, sid, gids, stamp, stories, socials, accounts)
+    log_seen(sheets, sid, gids, stamp, candidates, {s['url'] for s in stories})
+    log_run(sheets, sid, gids, stamp, len(candidates), len(stories), len(socials), 'ok')
     print(f'Done: {len(stories)} stories, {len(socials)} social posts')
-    print(f'  Sheet: https://docs.google.com/spreadsheets/d/{sheet_id}/edit')
-    print(f'  Doc:   https://docs.google.com/document/d/{doc_id}/edit')
+    print(f'  Sheet: https://docs.google.com/spreadsheets/d/{sid}/edit')
+
+    if args.doc:
+        label = f'{datetime.now(timezone.utc).astimezone():%A, %B %d, %Y %H:%M}'
+        doc_id = push_to_doc(stories, label)
+        print(f'  Doc:   https://docs.google.com/document/d/{doc_id}/edit')
+
+    # Local cache only; the sheet remains the source of truth.
+    STATE['seen'] = sorted(seen_stories | {s['url'] for s in stories})[-1500:]
+    STATE['seen_social'] = sorted(seen_social | {p['url'] for p in socials})[-1000:]
+    STATE['accounts'] = accounts
+    save_state(STATE)
 
 
 if __name__ == '__main__':
