@@ -26,3 +26,7 @@ npm-debug.log*
 /.secrets/
 *_token.json
 credentials*.json
+
+# revolver stories scraper state (published-URL memory) + run log
+scripts/.revolver_seen.json
+revolver_stories.log
