@@ -30,3 +30,7 @@ credentials*.json
 # revolver stories scraper state (published-URL memory) + run log
 scripts/.revolver_seen.json
 revolver_stories.log
+
+# python bytecode
+__pycache__/
+*.pyc
