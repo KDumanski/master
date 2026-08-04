@@ -258,12 +258,13 @@ STORY_SCHEMA = {
             'items': {
                 'type': 'object',
                 'additionalProperties': False,
-                'required': ['headline', 'url', 'source', 'blurb'],
+                'required': ['headline', 'url', 'source', 'blurb', 'summary'],
                 'properties': {
                     'headline': {'type': 'string'},
                     'url': {'type': 'string'},
                     'source': {'type': 'string'},
                     'blurb': {'type': 'string'},
+                    'summary': {'type': 'string'},
                 },
             },
         },
@@ -295,6 +296,8 @@ SECTION B - candidate stories pulled this morning from the source outlets' RSS f
 {cand}
 
 Select roughly {target} candidates from SECTION B that best fit the aggregator's editorial profile shown in SECTION A: politics, immigration, crime, DOJ/FBI, culture-war fights, foreign policy, economy, media criticism, plus the occasional offbeat or big mainstream story. Quality over quota: if fewer genuinely fit, return fewer. When several outlets carry the same underlying story, keep only the single strongest version. Skip pure celebrity filler, sports scores, and product/deal posts.
+
+For each selected story also write "summary": 2-3 plain, factual sentences saying what happened and why it matters, drawn ONLY from the headline and feed summary given (never invent facts). Neutral reporting voice, no em dashes.
 
 For each selected story write "blurb": a one-line description in the same voice as the SECTION A headlines. Rules for blurbs:
 - punchy, wry, populist-right editorial framing, like the SECTION A examples
@@ -465,7 +468,7 @@ def push_to_doc(stories, date_label):
 # ---------------------------------------------------------------- Google Sheet
 
 SHEET_TABS = {
-    'Stories':  ['Pulled', 'Story', 'Source', 'Description', 'Link'],
+    'Stories':  ['Pulled', 'Story', 'Source', 'Description', 'Link', 'Summary'],
     'Social':   ['Pulled', 'Account', 'Post', 'Link'],
     'Accounts': ['Account', 'Times linked', 'Last seen', 'Profile'],
     'Runs':     ['Pulled', 'Candidates', 'Stories added', 'Social added', 'Status'],
@@ -476,7 +479,7 @@ SHEET_TABS = {
 
 # Pixel widths per tab, in column order. Long prose columns get wrapped.
 SHEET_WIDTHS = {
-    'Stories':  [140, 400, 110, 450, 300],
+    'Stories':  [140, 400, 110, 450, 300, 460],
     'Social':   [140, 190, 620, 280],
     'Accounts': [170, 100, 100, 240],
     'Runs':     [140, 100, 110, 110, 420],
@@ -622,7 +625,8 @@ def load_seen_from_sheet(sheets, sid):
 
 def push_to_sheet(sheets, sid, gids, stamp, stories, socials, accounts):
     _prepend_rows(sheets, sid, gids['Stories'], 'Stories',
-                  [[stamp, s['headline'], s['source'], s['blurb'], s['url']]
+                  [[stamp, s['headline'], s['source'], s['blurb'], s['url'],
+                    s.get('summary', '')]
                    for s in stories])
     _prepend_rows(sheets, sid, gids['Social'], 'Social',
                   [[stamp, f'{p["account"]} (@{p["handle"]})', p['text'], p['url']]

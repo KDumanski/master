@@ -58,11 +58,10 @@ SECTIONS = [
 
 
 def classify(text):
+    """All matching sections in priority order (max 3); first is primary."""
     low = text.lower()
-    for name, keys in SECTIONS:
-        if any(k in low for k in keys):
-            return name
-    return 'Politics'
+    hits = [name for name, keys in SECTIONS if any(k in low for k in keys)]
+    return (hits or ['Politics'])[:3]
 
 
 def _og_image(url):
@@ -130,17 +129,20 @@ def main():
     sheets, sid = find_or_create_sheet(state)
 
     stories = []
-    for r in rows(sheets, sid, 'Stories!A2:E'):
+    for r in rows(sheets, sid, 'Stories!A2:F'):
         headline, url = cell(r, 1), cell(r, 4)
         if not headline or not url:
             continue
+        secs = classify(f'{headline} {cell(r, 3)}')
         stories.append({
             'pulled': cell(r, 0),
             'headline': headline,
             'source': cell(r, 2),
             'blurb': cell(r, 3),
             'url': url,
-            'section': classify(f'{headline} {cell(r, 3)}'),
+            'section': secs[0],     # primary (back-compat)
+            'sections': secs,       # all, for multi-chip display + filtering
+            'summary': cell(r, 5),  # AI summary, shown on hover
         })
 
     social = []
