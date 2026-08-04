@@ -12,7 +12,13 @@ gitignored. Nothing here ever gets committed.
 import os
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-SECRETS_DIR = os.path.join(SCRIPT_DIR, '..', '.secrets')
+# Repo layout keeps .secrets/ one level above scripts/ (masters/.secrets).
+# Server deployments (e.g. /root/revolver) are flat: the script and its
+# .secrets/ sit in the same directory. Prefer the repo layout when it exists,
+# fall back to the flat one so the same file runs unmodified in both places.
+_repo_secrets = os.path.join(SCRIPT_DIR, '..', '.secrets')
+_flat_secrets = os.path.join(SCRIPT_DIR, '.secrets')
+SECRETS_DIR = _repo_secrets if os.path.isdir(_repo_secrets) else _flat_secrets
 
 # The OAuth "client" file (installed-app type). Needed only when a token is
 # missing/unrefreshable and we must run a fresh consent flow.
