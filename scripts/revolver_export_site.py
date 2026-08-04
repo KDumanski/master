@@ -11,11 +11,15 @@ feed into the site repo; committing that file is what publishes an update.
 Run it after a sweep (or on a schedule) and push the site repo.
 """
 import argparse
+import concurrent.futures
 import json
 import os
+import re
 import sys
 from collections import Counter
 from datetime import datetime, timezone
+
+import requests
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
@@ -25,6 +29,10 @@ from revolver_stories import find_or_create_sheet, load_state  # noqa: E402
 SITE_DIR = os.environ.get(
     'REVOLVER_SITE_DIR', r'c:\Propcheck Git\clone\Revolver')
 OUT_FILE = os.path.join(SITE_DIR, 'data', 'feed.json')
+# url -> og:image (or "" for a known miss, so failures aren't refetched daily).
+IMG_CACHE = os.path.join(SITE_DIR, 'data', 'images.json')
+UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+     '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36')
 
 # Keyword -> section. First match wins, so order matters: narrower topics sit
 # above the catch-alls. Sections drive the site's filter chips.
@@ -55,6 +63,53 @@ def classify(text):
         if any(k in low for k in keys):
             return name
     return 'Politics'
+
+
+def _og_image(url):
+    """Best-effort og:image / twitter:image from an article page."""
+    try:
+        r = requests.get(url, headers={'User-Agent': UA}, timeout=10)
+        if r.status_code != 200:
+            return ''
+        head = r.text[:250000]
+        for pat in (
+            r'<meta[^>]+property=["\']og:image["\'][^>]*content=["\']([^"\']+)',
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]*property=["\']og:image',
+            r'<meta[^>]+name=["\']twitter:image["\'][^>]*content=["\']([^"\']+)',
+        ):
+            m = re.search(pat, head, re.I)
+            if m:
+                img = m.group(1).strip().replace('&amp;', '&')
+                if img.startswith('//'):
+                    img = 'https:' + img
+                if img.startswith('http'):
+                    return img
+        return ''
+    except requests.RequestException:
+        return ''
+
+
+def enrich_images(stories):
+    """Attach `image` to each story, fetching only URLs the cache hasn't seen."""
+    try:
+        with open(IMG_CACHE, encoding='utf-8') as f:
+            cache = json.load(f)
+    except (OSError, ValueError):
+        cache = {}
+    todo = [s['url'] for s in stories if s['url'] not in cache]
+    if todo:
+        print(f'Fetching og:image for {len(todo)} new stories ...')
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
+            for url, img in zip(todo, ex.map(_og_image, todo)):
+                cache[url] = img
+        os.makedirs(os.path.dirname(IMG_CACHE), exist_ok=True)
+        with open(IMG_CACHE, 'w', encoding='utf-8') as f:
+            json.dump(cache, f, indent=0)
+    hits = 0
+    for s in stories:
+        s['image'] = cache.get(s['url'], '')
+        hits += 1 if s['image'] else 0
+    print(f'  images: {hits}/{len(stories)} stories have one')
 
 
 def rows(sheets, sid, rng):
@@ -116,6 +171,8 @@ def main():
 
     runs = [{'pulled': cell(r, 0), 'status': cell(r, 4)}
             for r in rows(sheets, sid, 'Runs!A2:E') if cell(r, 0)]
+
+    enrich_images(stories)
 
     feed = {
         'generated': f'{datetime.now(timezone.utc):%Y-%m-%dT%H:%M:%SZ}',
