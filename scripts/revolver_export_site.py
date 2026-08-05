@@ -129,7 +129,7 @@ def main():
     sheets, sid = find_or_create_sheet(state)
 
     stories = []
-    for r in rows(sheets, sid, 'Stories!A2:F'):
+    for r in rows(sheets, sid, 'Stories!A2:G'):
         headline, url = cell(r, 1), cell(r, 4)
         if not headline or not url:
             continue
@@ -142,7 +142,8 @@ def main():
             'url': url,
             'section': secs[0],     # primary (back-compat)
             'sections': secs,       # all, for multi-chip display + filtering
-            'summary': cell(r, 5),  # AI summary, shown on hover
+            'summary': cell(r, 5),  # AI editorial read, shown on hover
+            'tags': [t.strip() for t in cell(r, 6).split(',') if t.strip()],
         })
 
     social = []

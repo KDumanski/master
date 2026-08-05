@@ -258,13 +258,14 @@ STORY_SCHEMA = {
             'items': {
                 'type': 'object',
                 'additionalProperties': False,
-                'required': ['headline', 'url', 'source', 'blurb', 'summary'],
+                'required': ['headline', 'url', 'source', 'blurb', 'summary', 'tags'],
                 'properties': {
                     'headline': {'type': 'string'},
                     'url': {'type': 'string'},
                     'source': {'type': 'string'},
                     'blurb': {'type': 'string'},
                     'summary': {'type': 'string'},
+                    'tags': {'type': 'array', 'items': {'type': 'string'}},
                 },
             },
         },
@@ -298,6 +299,8 @@ SECTION B - candidate stories pulled this morning from the source outlets' RSS f
 Select roughly {target} candidates from SECTION B that best fit the aggregator's editorial profile shown in SECTION A: politics, immigration, crime, DOJ/FBI, culture-war fights, foreign policy, economy, media criticism, plus the occasional offbeat or big mainstream story. Quality over quota: if fewer genuinely fit, return fewer. When several outlets carry the same underlying story, keep only the single strongest version. Skip pure celebrity filler, sports scores, and product/deal posts.
 
 For each selected story also write "summary": a 2-3 sentence EDITORIAL read in the site's voice. First state what happened (drawn ONLY from the headline and feed summary given, never invent facts), then give the sharp take: why it matters, what it reveals, the pattern it fits. Opinionated and punchy like a columnist's note, but every factual claim must come from the given material. No em dashes.
+
+For each selected story also write "tags": 3-6 short tags naming the concrete WHO/WHERE/WHAT of the story: people (e.g. "Trump", "Fauci"), organizations ("DOJ", "WNBA", "FIFA"), places ("Ceuta", "Berlin"), and named events or running stories ("Iran war", "Fauci hearing", "migrant crisis"). Reuse the same spelling for the same entity across stories so tags aggregate.
 
 For each selected story write "blurb": a one-line description in the same voice as the SECTION A headlines. Rules for blurbs:
 - punchy, wry, populist-right editorial framing, like the SECTION A examples
@@ -468,7 +471,7 @@ def push_to_doc(stories, date_label):
 # ---------------------------------------------------------------- Google Sheet
 
 SHEET_TABS = {
-    'Stories':  ['Pulled', 'Story', 'Source', 'Description', 'Link', 'Summary'],
+    'Stories':  ['Pulled', 'Story', 'Source', 'Description', 'Link', 'Summary', 'Tags'],
     'Social':   ['Pulled', 'Account', 'Post', 'Link'],
     'Accounts': ['Account', 'Times linked', 'Last seen', 'Profile'],
     'Runs':     ['Pulled', 'Candidates', 'Stories added', 'Social added', 'Status'],
@@ -479,7 +482,7 @@ SHEET_TABS = {
 
 # Pixel widths per tab, in column order. Long prose columns get wrapped.
 SHEET_WIDTHS = {
-    'Stories':  [140, 400, 110, 450, 300, 460],
+    'Stories':  [140, 400, 110, 450, 300, 460, 220],
     'Social':   [140, 190, 620, 280],
     'Accounts': [170, 100, 100, 240],
     'Runs':     [140, 100, 110, 110, 420],
@@ -626,7 +629,7 @@ def load_seen_from_sheet(sheets, sid):
 def push_to_sheet(sheets, sid, gids, stamp, stories, socials, accounts):
     _prepend_rows(sheets, sid, gids['Stories'], 'Stories',
                   [[stamp, s['headline'], s['source'], s['blurb'], s['url'],
-                    s.get('summary', '')]
+                    s.get('summary', ''), ', '.join(s.get('tags', []))]
                    for s in stories])
     _prepend_rows(sheets, sid, gids['Social'], 'Social',
                   [[stamp, f'{p["account"]} (@{p["handle"]})', p['text'], p['url']]
