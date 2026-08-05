@@ -129,7 +129,7 @@ def main():
     sheets, sid = find_or_create_sheet(state)
 
     stories = []
-    for r in rows(sheets, sid, 'Stories!A2:G'):
+    for r in rows(sheets, sid, 'Stories!A2:I'):
         headline, url = cell(r, 1), cell(r, 4)
         if not headline or not url:
             continue
@@ -144,6 +144,10 @@ def main():
             'sections': secs,       # all, for multi-chip display + filtering
             'summary': cell(r, 5),  # AI editorial read, shown on hover
             'tags': [t.strip() for t in cell(r, 6).split(',') if t.strip()],
+            # AI story-type labels (Deep Cut / Opinion / News / Video / Social)
+            # + the platform it came from; rows predating the columns get [].
+            'labels': [t.strip() for t in cell(r, 7).split(',') if t.strip()],
+            'platform': cell(r, 8) or 'News',
         })
 
     social = []
@@ -182,6 +186,10 @@ def main():
         'counts': {'stories': len(stories), 'social': len(social),
                    'accounts': len(accounts), 'runs': len(runs)},
         'sections': [s for s, _ in SECTIONS] + ['Politics'],
+        'labels': [s for s, _ in Counter(
+            lb for x in stories for lb in x['labels']).most_common()],
+        'platforms': [s for s, _ in Counter(
+            x['platform'] for x in stories).most_common()],
         'sources': [s for s, _ in Counter(x['source'] for x in stories).most_common()],
         'last_pull': runs[0]['pulled'] if runs else (
             stories[0]['pulled'] if stories else ''),

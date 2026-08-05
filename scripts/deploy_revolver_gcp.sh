@@ -21,7 +21,8 @@ echo "==> Creating $REMOTE on $SERVER"
 ssh "$SERVER" "mkdir -p $REMOTE/.secrets && chmod 700 $REMOTE/.secrets"
 
 echo "==> Copying code"
-scp -q "$HERE/revolver_stories.py" "$HERE/google_auth.py" "$SERVER:$REMOTE/"
+scp -q "$HERE/revolver_stories.py" "$HERE/revolver_sources.json" \
+       "$HERE/google_auth.py" "$SERVER:$REMOTE/"
 
 echo "==> Copying Google credentials (personal Drive token + OAuth client)"
 scp -q "$HERE/../.secrets/personal_drive_token.json" \

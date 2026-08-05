@@ -1,18 +1,24 @@
 """
-Revolver News stories — half-hourly source sweep -> Google Sheet.
+Revolver News stories — half-hourly multi-platform sweep -> Google Sheet.
 
 Runs every 30 minutes (cron on the GCP box, see deploy_revolver_gcp.sh) and:
   1. Fetches revolver.news (Drudge-style aggregator) to snapshot the headlines
      it is currently running: that gives the topic mix AND the editorial voice.
-  2. Pulls fresh stories from the RSS feeds of the outlets Revolver actually
-     links out to (NY Post, Fox, Breitbart, Zero Hedge, Headline USA, etc.).
+  2. Pulls fresh candidates from every source in revolver_sources.json: news
+     RSS, Substack, Medium, blogs, Reddit, Trump's Truth Social feed, YouTube
+     channels (native RSS), Rumble channels (scraped), Telegram channels
+     (public t.me/s pages). Add a source by editing the JSON, no code change.
   3. Collects the X/Twitter posts Revolver links (tweet text via the public
      oEmbed endpoint, no API key) and keeps a running roster of the accounts
      it surveys (top 200 by link count, grows daily).
-  4. Has Claude pick the candidates that fit Revolver's editorial profile and
-     write a one-line blurb for each in the same punchy voice (trailing "...",
-     no em dashes).
-  5. Pushes to the Google SHEET "Revolver News stories" — tabs Stories /
+  4. Fetches a mainstream "radar" corpus (CNN/NYT/BBC/... headlines, never
+     candidates) and clusters candidates across sources, so each one carries
+     how many outlets ran it and whether the mainstream has it. Single-outlet
+     stories missing from the radar are DEEP CUTS and get selection priority.
+  5. Has Claude pick the candidates that fit Revolver's editorial profile,
+     write a one-line blurb in the same punchy voice (trailing "...", no em
+     dashes), and label each story: Deep Cut / Opinion / News / Video / Social.
+  6. Pushes to the Google SHEET "Revolver News stories" — tabs Stories /
      Social / Accounts / Runs, newest rows on top, every row stamped with the
      exact pull time. The Runs tab records EVERY check, including the quiet
      ones, so you can see the job is alive and when each pull happened.
@@ -64,38 +70,40 @@ UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36')
 
 MAX_AGE_HOURS = 36        # ignore feed entries older than this
-MAX_PER_SOURCE = 25       # candidates taken per outlet
+MAX_PER_SOURCE = 25       # default candidates taken per source (config can lower)
 MAX_CANDIDATES = 400      # hard cap sent to Claude
 TARGET_STORIES = '30-50'  # how many stories Claude should pick
 TOP_ACCOUNTS = 200        # roster size on the Accounts tab
 
-# The outlets revolver.news links out to most (measured from its front page).
-# Each source lists feed URLs to try in order; first one that parses wins.
-SOURCES = {
-    'NY Post':          ['https://nypost.com/feed/'],
-    'Fox News':         ['https://moxie.foxnews.com/google-publisher/latest.xml',
-                         'https://www.foxnews.com/rss'],
-    'Breitbart':        ['https://www.breitbart.com/feed/'],
-    'Zero Hedge':       ['https://cms.zerohedge.com/fullrss2.xml',
-                         'https://feeds.feedburner.com/zerohedge/feed'],
-    'Headline USA':     ['https://headlineusa.com/feed/'],
-    # Western Journal blocks non-browser fetches outright; kept in case that
-    # changes — a failed feed is skipped gracefully.
-    'Western Journal':  ['https://www.westernjournal.com/feed/'],
-    'Just The News':    ['https://justthenews.com/rss.xml',
-                         'https://justthenews.com/feed'],
-    'Daily Wire':       ['https://www.dailywire.com/feeds/rss.xml',
-                         'https://www.dailywire.com/rss.xml'],
-    'Slay News':        ['https://slaynews.com/feed/'],
-    'Daily Caller':     ['https://dailycaller.com/feed/'],
-    'CNBC':             ['https://search.cnbc.com/rs/search/combinedcms/view.xml'
-                         '?partnerId=wrss01&id=100003114'],
-    'American Thinker': ['https://feeds.feedburner.com/americanthinker'],
-    'BizPac Review':    ['https://www.bizpacreview.com/feed/'],
-    'LifeSiteNews':     ['https://www.lifesitenews.com/feed/'],
-    'Mediaite':         ['https://www.mediaite.com/feed/'],
-    'Discern Report':   ['https://discernreport.com/feed/'],
-}
+STORY_LABELS = ['Deep Cut', 'Opinion', 'News', 'Video', 'Social']
+
+SOURCES_FILE = os.path.join(SCRIPT_DIR, 'revolver_sources.json')
+
+
+def load_sources_config():
+    """revolver_sources.json holds the whole roster (news RSS, Substack,
+    Medium, YouTube, Rumble, Telegram, Truth Social, blogs, Reddit) plus the
+    mainstream radar feeds. Fall back to a minimal news list if the config is
+    missing so the cron never goes fully dark."""
+    try:
+        with open(SOURCES_FILE, encoding='utf-8') as f:
+            cfg = json.load(f)
+        sources = [s for s in cfg.get('sources', []) if s.get('enabled')]
+        return sources, cfg.get('radar', {})
+    except (OSError, ValueError) as e:
+        print(f'  WARNING: could not read {SOURCES_FILE} ({e}); '
+              'falling back to built-in news feeds')
+        fallback = [
+            {'name': 'NY Post', 'platform': 'News', 'type': 'rss',
+             'feeds': ['https://nypost.com/feed/']},
+            {'name': 'Breitbart', 'platform': 'News', 'type': 'rss',
+             'feeds': ['https://www.breitbart.com/feed/']},
+            {'name': 'Zero Hedge', 'platform': 'News', 'type': 'rss',
+             'feeds': ['https://cms.zerohedge.com/fullrss2.xml']},
+            {'name': 'Daily Caller', 'platform': 'News', 'type': 'rss',
+             'feeds': ['https://dailycaller.com/feed/']},
+        ]
+        return fallback, {}
 
 
 # ---------------------------------------------------------------- fetching
@@ -193,20 +201,130 @@ def fetch_social_posts(social_urls, seen_social):
     return posts
 
 
+def rss_entries(feed_urls):
+    """Feed URLs tried in order; first that parses wins."""
+    for fu in feed_urls:
+        raw = fetch_url(fu)
+        if not raw:
+            continue
+        parsed = feedparser.parse(raw)
+        if parsed.entries:
+            return parsed.entries
+    return []
+
+
+def resolve_youtube_channel(handle):
+    """@handle -> UC... channel id (every channel has a built-in RSS feed).
+    Cached in local state so the page fetch happens once per channel. The
+    SOCS/CONSENT cookies skip YouTube's consent interstitial, which otherwise
+    replaces the whole page on some networks."""
+    cache = STATE.setdefault('yt_channels', {})
+    if handle in cache:
+        return cache[handle]
+    try:
+        r = requests.get(f'https://www.youtube.com/@{handle}',
+                         headers={'User-Agent': UA,
+                                  'Accept-Language': 'en-US,en;q=0.9'},
+                         cookies={'SOCS': 'CAI', 'CONSENT': 'YES+1'},
+                         timeout=30)
+        page = r.text if r.status_code == 200 else None
+    except requests.RequestException:
+        page = None
+    m = page and re.search(
+        r'"(?:externalId|browseId|channelId)":"(UC[\w-]{22})"', page)
+    if m:
+        cache[handle] = m.group(1)
+        return m.group(1)
+    return None
+
+
+def youtube_entries(src):
+    cid = resolve_youtube_channel(src['handle'])
+    if not cid:
+        return []
+    return rss_entries([f'https://www.youtube.com/feeds/videos.xml?channel_id={cid}'])
+
+
+def rumble_entries(src, seen_urls):
+    """Latest own-channel videos from a Rumble channel. The video LIST is
+    JS-rendered, but the channel page and /videos tab each server-render the
+    newest item(s), marked with e9s=src_v1_ucp (sidebar recommendations carry
+    other e9s tags and must be ignored). At a 30-minute cadence that still
+    catches every upload. Titles come from each video page's og:title, only
+    fetched for URLs not already in the sheet."""
+    links = []
+    base = src['channel'].rstrip('/')
+    for path in ('', '/videos'):
+        page = fetch_url(base + path)
+        if not page:
+            continue
+        for m in re.finditer(
+                r'href="(/v[a-z0-9]+-[^"]+?\.html)\?e9s=src_v1_ucp', page):
+            url = 'https://rumble.com' + m.group(1)
+            if url not in links:
+                links.append(url)
+    entries = []
+    for url in links[:6]:
+        if url in seen_urls:
+            continue
+        title = ''
+        vid = fetch_url(url)
+        m = vid and (re.search(r'property="og:title"[^>]*content="([^"]+)"', vid)
+                     or re.search(r'content="([^"]+)"[^>]*property="og:title"', vid))
+        if m:
+            title = (m.group(1).replace('&amp;', '&').replace('&#39;', "'")
+                     .replace('&quot;', '"'))
+        else:
+            slug = re.sub(r'^v[a-z0-9]+-', '', url.rsplit('/', 1)[-1])
+            title = re.sub(r'\.html$', '', slug).replace('-', ' ').capitalize()
+        entries.append({'title': title, 'link': url, 'summary': ''})
+    return entries
+
+
+def telegram_entries(src):
+    """Public Telegram channels expose a scrape-friendly t.me/s/<name> page.
+    The message text becomes the headline (posts have no titles)."""
+    page = fetch_url(f'https://t.me/s/{src["channel"]}')
+    if not page:
+        return []
+    entries = []
+    for m in re.finditer(
+            r'data-post="([^"]+/\d+)".*?tgme_widget_message_text[^>]*>(.*?)</div>',
+            page, re.S):
+        post, html_text = m.group(1), m.group(2)
+        text = re.sub(r'<br\s*/?>', ' ', html_text)
+        text = re.sub(r'<[^>]+>', '', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        text = (text.replace('&#39;', "'").replace('&quot;', '"')
+                    .replace('&amp;', '&'))
+        if len(text) < 30:      # stickers, emoji-only posts, join links
+            continue
+        entries.append({'title': text[:180], 'link': f'https://t.me/{post}',
+                        'summary': text[180:400]})
+    return entries[::-1]        # t.me/s lists oldest first; newest first here
+
+
 def collect_candidates(sources, seen_urls):
-    """Pull fresh entries from every source feed."""
+    """Pull fresh entries from every configured source, any platform."""
     now = time.time()
     candidates, feed_report = [], []
-    for name, feed_urls in sources.items():
-        entries = []
-        for fu in feed_urls:
-            raw = fetch_url(fu)
-            if not raw:
-                continue
-            parsed = feedparser.parse(raw)
-            if parsed.entries:
-                entries = parsed.entries
-                break
+    run_seen = set()      # feeds sometimes list the same URL twice in one pull
+    for src in sources:
+        name, platform = src['name'], src.get('platform', 'News')
+        stype = src.get('type', 'rss')
+        cap = src.get('max', MAX_PER_SOURCE)
+        try:
+            if stype == 'youtube':
+                entries = youtube_entries(src)
+            elif stype == 'rumble':
+                entries = rumble_entries(src, seen_urls)
+            elif stype == 'telegram':
+                entries = telegram_entries(src)
+            else:
+                entries = rss_entries(src.get('feeds', []))
+        except Exception as e:
+            feed_report.append(f'  {name}: ERROR {e}')
+            continue
         if not entries:
             feed_report.append(f'  {name}: FEED FAILED')
             continue
@@ -214,20 +332,90 @@ def collect_candidates(sources, seen_urls):
         for e in entries:
             link = (e.get('link') or '').strip()
             title = re.sub(r'\s+', ' ', e.get('title') or '').strip()
-            if not link or not title or link in seen_urls:
+            if not link or not title or link in seen_urls or link in run_seen:
                 continue
             ts = e.get('published_parsed') or e.get('updated_parsed')
             if ts and (now - time.mktime(ts)) > MAX_AGE_HOURS * 3600:
                 continue
+            run_seen.add(link)
             summary = re.sub(r'<[^>]+>', '', e.get('summary') or '')
             summary = re.sub(r'\s+', ' ', summary).strip()[:160]
-            candidates.append({'source': name, 'headline': title,
-                               'url': link, 'summary': summary})
+            candidates.append({'source': name, 'platform': platform,
+                               'headline': title, 'url': link,
+                               'summary': summary})
             kept += 1
-            if kept >= MAX_PER_SOURCE:
+            if kept >= cap:
                 break
         feed_report.append(f'  {name}: {kept} fresh')
     return candidates[:MAX_CANDIDATES], feed_report
+
+
+# ------------------------------------------------------- rarity / Deep Cuts
+
+STOP_WORDS = {
+    'the', 'and', 'for', 'that', 'with', 'this', 'from', 'have', 'has', 'was',
+    'are', 'will', 'his', 'her', 'its', 'their', 'they', 'them', 'you', 'your',
+    'who', 'what', 'when', 'where', 'why', 'how', 'not', 'but', 'out', 'over',
+    'after', 'before', 'into', 'about', 'says', 'said', 'new', 'just', 'more',
+    'been', 'were', 'than', 'then', 'now', 'off', 'all', 'can', 'could',
+    'would', 'should', 'may', 'might', 'get', 'gets', 'amid', 'during',
+    'against', 'while', 'because', 'video', 'watch', 'report', 'breaking',
+}
+
+
+def sig_tokens(title):
+    """Significant title tokens for cross-outlet story matching."""
+    return {w for w in re.findall(r"[a-z][a-z']+", title.lower())
+            if w not in STOP_WORDS and len(w) > 2}
+
+
+def _same_story(a, b):
+    """Two headlines describe the same underlying story if their significant
+    tokens overlap enough. Calibrated on live pairs (2026-08-05): true matches
+    score inter 4-7 / jaccard 0.25-0.55. Leaning loose is the safe direction:
+    a missed match falsely brands a common story a Deep Cut, which cheapens
+    the label; an extra match merely withholds it."""
+    if not a or not b:
+        return False
+    inter = len(a & b)
+    jac = inter / len(a | b)
+    return inter >= 5 or (inter >= 4 and jac >= 0.25) or jac >= 0.45
+
+
+def fetch_radar(radar_feeds):
+    """Headline token sets from the mainstream comparison corpus. These are
+    NEVER candidates; they only tell us what the mainstream is covering."""
+    titles = []
+    for name, feed_urls in radar_feeds.items():
+        for e in rss_entries(feed_urls)[:40]:
+            t = re.sub(r'\s+', ' ', e.get('title') or '').strip()
+            if t:
+                titles.append(sig_tokens(t))
+    return titles
+
+
+def annotate_rarity(candidates, radar_tokens):
+    """Cluster candidates across sources and tag each with how many outlets
+    ran the story and whether the mainstream radar has it. outlets=1 and
+    mainstream=False is the Deep Cut signal."""
+    toks = [sig_tokens(c['headline']) for c in candidates]
+    cluster_of = [-1] * len(candidates)
+    clusters = []      # each: {'rep': token_set, 'sources': set()}
+    for i, tk in enumerate(toks):
+        for ci, cl in enumerate(clusters):
+            if _same_story(tk, cl['rep']):
+                cluster_of[i] = ci
+                cl['sources'].add(candidates[i]['source'])
+                cl['rep'] = cl['rep'] | tk
+                break
+        else:
+            cluster_of[i] = len(clusters)
+            clusters.append({'rep': set(tk),
+                             'sources': {candidates[i]['source']}})
+    for i, c in enumerate(candidates):
+        c['outlets'] = len(clusters[cluster_of[i]]['sources'])
+        c['mainstream'] = any(_same_story(toks[i], r) for r in radar_tokens)
+    return candidates
 
 
 # ---------------------------------------------------------------- Claude
@@ -258,7 +446,8 @@ STORY_SCHEMA = {
             'items': {
                 'type': 'object',
                 'additionalProperties': False,
-                'required': ['headline', 'url', 'source', 'blurb', 'summary', 'tags'],
+                'required': ['headline', 'url', 'source', 'blurb', 'summary',
+                             'tags', 'labels'],
                 'properties': {
                     'headline': {'type': 'string'},
                     'url': {'type': 'string'},
@@ -266,6 +455,9 @@ STORY_SCHEMA = {
                     'blurb': {'type': 'string'},
                     'summary': {'type': 'string'},
                     'tags': {'type': 'array', 'items': {'type': 'string'}},
+                    'labels': {'type': 'array',
+                               'items': {'type': 'string',
+                                         'enum': STORY_LABELS}},
                 },
             },
         },
@@ -280,8 +472,10 @@ def pick_and_blurb(revolver_heads, candidates):
 
     ref = '\n'.join(f'- {h}' for h in revolver_heads) or '(homepage unreachable today)'
     cand = '\n'.join(
-        f'{i}. [{c["source"]}] {c["headline"]} | {c["url"]}'
+        f'{i}. [{c.get("platform", "News")}: {c["source"]}] {c["headline"]} | {c["url"]}'
         + (f' | {c["summary"]}' if c['summary'] else '')
+        + f' | outlets:{c.get("outlets", 1)}'
+        + f' | mainstream:{"yes" if c.get("mainstream") else "no"}'
         for i, c in enumerate(candidates, 1))
 
     # Runs every 30 minutes, so a batch may be 5 candidates or 250. Scale the
@@ -293,10 +487,20 @@ def pick_and_blurb(revolver_heads, candidates):
 SECTION A - the headlines currently running on revolver.news (this is your reference for BOTH the topic mix and the editorial voice):
 {ref}
 
-SECTION B - candidate stories pulled this morning from the source outlets' RSS feeds:
+SECTION B - candidate items pulled this run from the source roster. Each line shows [Platform: Source], the headline (for video and social posts, the title or post text), the URL, sometimes a summary, then two rarity signals: "outlets:" = how many of our sources ran this same underlying story this run, and "mainstream:" = whether it also appears in a mainstream wire/network radar (CNN, NYT, BBC, NPR, ABC, CBS, The Hill):
 {cand}
 
 Select roughly {target} candidates from SECTION B that best fit the aggregator's editorial profile shown in SECTION A: politics, immigration, crime, DOJ/FBI, culture-war fights, foreign policy, economy, media criticism, plus the occasional offbeat or big mainstream story. Quality over quota: if fewer genuinely fit, return fewer. When several outlets carry the same underlying story, keep only the single strongest version. Skip pure celebrity filler, sports scores, and product/deal posts.
+
+PRIORITIZE RARE FINDS: a candidate with outlets:1 and mainstream:no is a story nobody else is running. When such a story genuinely fits the profile, prefer it over the tenth version of a story everyone already has. These are the site's most valuable picks.
+
+For each selected story also write "labels": 1-2 labels from exactly this set: "Deep Cut", "Opinion", "News", "Video", "Social". Rules:
+- "Deep Cut" when outlets:1 and mainstream:no (rare story nobody else has); it can combine with any other label
+- "Opinion" for essays, columns, and analysis pieces (most Substack, Medium, and American Thinker items)
+- "News" for straight reported stories
+- "Video" for YouTube and Rumble items
+- "Social" for Telegram and Truth Social posts
+Every story gets exactly one of Opinion/News/Video/Social, plus Deep Cut when it qualifies.
 
 For each selected story also write "summary": a 2-3 sentence EDITORIAL read in the site's voice. First state what happened (drawn ONLY from the headline and feed summary given, never invent facts), then give the sharp take: why it matters, what it reveals, the pattern it fits. Opinionated and punchy like a columnist's note, but every factual claim must come from the given material. No em dashes.
 
@@ -349,11 +553,27 @@ Copy "headline", "url" and "source" for each pick exactly as given in SECTION B.
         raise RuntimeError('Claude declined the selection request (refusal)')
     text = ''.join(b.text for b in resp.content if b.type == 'text')
     stories = json.loads(text)['stories']
-    # Belt and braces on the two hard style rules.
+    # Belt and braces on the two hard style rules, plus label hygiene: every
+    # story carries its platform, a base type label, and the Deep Cut label
+    # whenever the rarity signals say it qualifies (even if the model forgot).
+    by_url = {c['url']: c for c in candidates}
+    base_by_platform = {'YouTube': 'Video', 'Rumble': 'Video',
+                        'Telegram': 'Social', 'Truth Social': 'Social',
+                        'X': 'Social', 'TikTok': 'Video',
+                        'Substack': 'Opinion', 'Medium': 'Opinion'}
     for s in stories:
         s['blurb'] = s['blurb'].replace('\u2014', ', ').replace('--', ',').strip()
         if not s['blurb'].endswith('...'):
             s['blurb'] = s['blurb'].rstrip('.') + '...'
+        c = by_url.get(s['url'], {})
+        s['platform'] = c.get('platform', 'News')
+        labels = [lb for lb in s.get('labels', []) if lb in STORY_LABELS]
+        if not any(lb != 'Deep Cut' for lb in labels):
+            labels.append(base_by_platform.get(s['platform'], 'News'))
+        if (c.get('outlets', 1) == 1 and not c.get('mainstream')
+                and 'Deep Cut' not in labels):
+            labels.insert(0, 'Deep Cut')
+        s['labels'] = labels
     return stories
 
 
@@ -471,7 +691,8 @@ def push_to_doc(stories, date_label):
 # ---------------------------------------------------------------- Google Sheet
 
 SHEET_TABS = {
-    'Stories':  ['Pulled', 'Story', 'Source', 'Description', 'Link', 'Summary', 'Tags'],
+    'Stories':  ['Pulled', 'Story', 'Source', 'Description', 'Link', 'Summary',
+                 'Tags', 'Labels', 'Platform'],
     'Social':   ['Pulled', 'Account', 'Post', 'Link'],
     'Accounts': ['Account', 'Times linked', 'Last seen', 'Profile'],
     'Runs':     ['Pulled', 'Candidates', 'Stories added', 'Social added', 'Status'],
@@ -482,7 +703,7 @@ SHEET_TABS = {
 
 # Pixel widths per tab, in column order. Long prose columns get wrapped.
 SHEET_WIDTHS = {
-    'Stories':  [140, 400, 110, 450, 300, 460, 220],
+    'Stories':  [140, 400, 110, 450, 300, 460, 220, 140, 110],
     'Social':   [140, 190, 620, 280],
     'Accounts': [170, 100, 100, 240],
     'Runs':     [140, 100, 110, 110, 420],
@@ -591,6 +812,20 @@ def ensure_tabs(sheets, sid):
                 body={'values': [SHEET_TABS[t]]}).execute()
         format_sheet(sheets, sid, gids)
         print(f'  added missing tab(s): {", ".join(missing)}')
+    # Header migration: an existing sheet predating new columns (e.g. Labels /
+    # Platform on Stories) gets its header row extended in place.
+    try:
+        head = sheets.spreadsheets().values().get(
+            spreadsheetId=sid, range='Stories!1:1').execute().get('values', [[]])[0]
+        want = SHEET_TABS['Stories']
+        if len(head) < len(want):
+            sheets.spreadsheets().values().update(
+                spreadsheetId=sid, range='Stories!A1', valueInputOption='RAW',
+                body={'values': [want]}).execute()
+            format_sheet(sheets, sid, gids)
+            print(f'  extended Stories header to {len(want)} columns')
+    except Exception:
+        pass
     return gids
 
 
@@ -629,7 +864,8 @@ def load_seen_from_sheet(sheets, sid):
 def push_to_sheet(sheets, sid, gids, stamp, stories, socials, accounts):
     _prepend_rows(sheets, sid, gids['Stories'], 'Stories',
                   [[stamp, s['headline'], s['source'], s['blurb'], s['url'],
-                    s.get('summary', ''), ', '.join(s.get('tags', []))]
+                    s.get('summary', ''), ', '.join(s.get('tags', [])),
+                    ', '.join(s.get('labels', [])), s.get('platform', 'News')]
                    for s in stories])
     _prepend_rows(sheets, sid, gids['Social'], 'Social',
                   [[stamp, f'{p["account"]} (@{p["handle"]})', p['text'], p['url']]
@@ -676,9 +912,9 @@ def main():
                     help='also append a table to the companion Google Doc')
     args = ap.parse_args()
 
-    sources = SOURCES
+    sources, radar_feeds = load_sources_config()
     if args.test:
-        sources = {k: SOURCES[k] for k in list(SOURCES)[:3]}
+        sources = sources[:3]
 
     stamp = f'{datetime.now(timezone.utc).astimezone():%Y-%m-%d %H:%M}'
     print(f'[{stamp}] Revolver sweep starting ...')
@@ -723,6 +959,15 @@ def main():
             print(f'  Sheet: https://docs.google.com/spreadsheets/d/{sid}/edit')
         return
 
+    # Rarity pass: how many of our sources ran each story, and does the
+    # mainstream have it. Feeds the Deep Cut label + selection priority.
+    radar_tokens = fetch_radar(radar_feeds)
+    candidates = annotate_rarity(candidates, radar_tokens)
+    n_rare = sum(1 for c in candidates
+                 if c['outlets'] == 1 and not c['mainstream'])
+    print(f'  radar: {len(radar_tokens)} mainstream headlines; '
+          f'{n_rare}/{len(candidates)} candidates look like deep cuts')
+
     print('Asking Claude to pick stories and write blurbs ...')
     try:
         stories = pick_and_blurb(heads, candidates)
@@ -736,7 +981,8 @@ def main():
 
     if args.test or args.dry_run:
         for s in stories:
-            print(f'\n* {s["headline"]}  [{s["source"]}]')
+            print(f'\n* {s["headline"]}  [{s.get("platform", "News")}: {s["source"]}]'
+                  f'  {{{", ".join(s.get("labels", []))}}}')
             print(f'    {s["blurb"]}')
             print(f'    {s["url"]}')
         for p in socials:
